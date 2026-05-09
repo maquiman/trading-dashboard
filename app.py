@@ -941,6 +941,13 @@ def main():
             st.error("Downloaded data is missing required OHLC columns.")
             return
 
+        close_series_warning = None
+        try:
+            close_series = get_series(df, "Close").dropna()
+        except (KeyError, IndexError):
+            close_series = pd.Series(dtype="float64")
+            close_series_warning = "Closing-price data is unavailable for this selection, so 20-bar return could not be calculated."
+
         started_at = perf_counter()
         market_metrics = build_market_metrics_cached(df, ticker, interval)
         record_timing("Core indicator statistics", started_at)
@@ -1271,10 +1278,16 @@ def main():
             st.write(f"Current/visual analysis uses swing sensitivity N = {swing_sensitivity}, cluster tolerance {cluster_tolerance_pct:.2f}%, and actionable threshold {actionable_threshold_pct:.2f}%.")
 
         twenty_bar_return = None
-        if len(close_series) > 20:
+        if close_series_warning is None and len(close_series) <= 20:
+            close_series_warning = (
+                f"Only {len(close_series)} clean closing-price bars are available, so 20-bar return is not reliable for this selection."
+            )
+        if close_series_warning is None and len(close_series) > 20:
             prior_close = close_series.shift(20).iloc[-1]
             if pd.notna(prior_close) and prior_close != 0:
                 twenty_bar_return = (close_series.iloc[-1] / prior_close - 1) * 100
+        if close_series_warning:
+            st.warning(close_series_warning)
 
         st.divider()
         st.subheader("Key Metrics")
