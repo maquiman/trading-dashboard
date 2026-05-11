@@ -41,6 +41,8 @@ LARGE_DATE_RANGE_WARNING_DAYS = 3650
 MAX_VCP_ANALYSIS_ROWS = 1500
 MAX_BACKTEST_ROWS = 1800
 MIN_RELIABLE_VCP_ROWS = 80
+MIN_BACKTEST_CONFIDENCE_SIGNALS = 20
+MAX_BACKTEST_SIGNAL_MARKERS = 120
 
 
 def configure_yfinance_cache() -> None:
@@ -241,11 +243,13 @@ def get_help_text(key: str | None) -> str | None:
     return TOOLTIPS.get(key)
 
 
-def metric_with_help(container, label: str, value, delta=None, help_key: str | None = None) -> None:
+def metric_with_help(container, label: str, value, delta=None, help_key: str | None = None, **extra_kwargs) -> None:
     """Render a Streamlit metric with centralized help text."""
-    kwargs = {}
+    kwargs = dict(extra_kwargs)
     if delta is not None:
         kwargs["delta"] = delta
+    else:
+        kwargs.pop("delta_color", None)
     help_text = get_help_text(help_key)
     if help_text:
         kwargs["help"] = help_text
@@ -336,6 +340,356 @@ def render_callout_box(title: str, message: str, accent: str) -> None:
     )
 
 
+def get_forward_return_column(horizon: int) -> str:
+    """Return the signal-history column name for a forward-return horizon."""
+    return f"forward_return_{horizon}"
+
+
+def validate_backtest_signal_history(signal_history: pd.DataFrame) -> list[str]:
+    """Validate the columns needed by the backtest visualization layer."""
+    required_columns = {
+        "signal",
+        "position",
+        "close",
+        "score",
+        "regime",
+        "signal_style",
+        "forward_return_5",
+        "forward_return_10",
+        "forward_return_20",
+    }
+    return sorted(required_columns - set(signal_history.columns))
+
+
+def get_actionable_signal_history(signal_history: pd.DataFrame, horizon: int | None = None) -> pd.DataFrame:
+    """Return BUY/SELL rows, optionally filtered to rows with a valid forward-return horizon."""
+    if signal_history is None or signal_history.empty or "signal" not in signal_history.columns:
+        return pd.DataFrame()
+
+    actionable_history = signal_history[signal_history["signal"].isin(["BUY", "SELL"])].copy()
+    if horizon is not None:
+        forward_column = get_forward_return_column(horizon)
+        if forward_column not in actionable_history.columns:
+            return pd.DataFrame()
+        actionable_history = actionable_history[actionable_history[forward_column].notna()].copy()
+    return actionable_history
+
+
+def build_backtest_equity_frame(df: pd.DataFrame, signal_history: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruct the approximate rule-based equity curve from signal-history positions."""
+    if signal_history is None or signal_history.empty or "position" not in signal_history.columns:
+        return pd.DataFrame()
+
+    close_series = get_series(df, "Close").dropna()
+    if close_series.empty:
+        return pd.DataFrame()
+
+    close_returns = close_series.pct_change().fillna(0.0)
+    aligned_positions = signal_history["position"].reindex(close_series.index).ffill().fillna(0.0)
+    strategy_returns = aligned_positions.shift(1).fillna(0.0) * close_returns
+
+    return pd.DataFrame(
+        {
+            "Strategy Cumulative Return %": ((1 + strategy_returns).cumprod() - 1) * 100,
+            "Buy-and-Hold Return %": ((1 + close_returns).cumprod() - 1) * 100,
+        },
+        index=close_series.index,
+    )
+
+
+def create_backtest_equity_chart(equity_frame: pd.DataFrame) -> go.Figure:
+    """Plot approximate strategy equity against buy-and-hold."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=equity_frame.index,
+            y=equity_frame["Strategy Cumulative Return %"],
+            mode="lines",
+            name="Strategy cumulative return",
+            line=dict(color="#38bdf8", width=3),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=equity_frame.index,
+            y=equity_frame["Buy-and-Hold Return %"],
+            mode="lines",
+            name="Buy-and-hold cumulative return",
+            line=dict(color="#f59e0b", width=2, dash="dash"),
+        )
+    )
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(226,232,240,0.45)")
+    fig.update_layout(
+        title="Approximate Rule-Based Equity Curve",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=60, b=30, l=40, r=30),
+        yaxis_title="Cumulative Return %",
+        xaxis_title="Date",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def create_forward_return_histogram(actionable_history: pd.DataFrame, horizon: int) -> go.Figure:
+    """Create a histogram of directional forward returns after actionable signals."""
+    forward_column = get_forward_return_column(horizon)
+    series = actionable_history[forward_column].dropna()
+    bin_count = max(10, min(40, int(np.sqrt(len(series))) + 5))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=series,
+            nbinsx=bin_count,
+            marker_color="#22c55e",
+            opacity=0.85,
+            name=f"{horizon}-bar forward returns",
+        )
+    )
+    fig.add_vline(x=0, line_dash="dash", line_color="#f87171")
+    fig.update_layout(
+        title=f"Forward Return Distribution ({horizon}-Bar Horizon)",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=60, b=30, l=40, r=30),
+        xaxis_title="Directional Forward Return %",
+        yaxis_title="Signal Count",
+        showlegend=False,
+    )
+    return fig
+
+
+def build_horizon_comparison_table(actionable_history: pd.DataFrame) -> pd.DataFrame:
+    """Summarize directional forward returns across standard horizons."""
+    rows = []
+    for horizon in (5, 10, 20):
+        forward_column = get_forward_return_column(horizon)
+        series = actionable_history[forward_column].dropna()
+        rows.append(
+            {
+                "Horizon": f"{horizon} bars",
+                "Signals": int(len(series)),
+                "Average Forward Return %": float(series.mean()) if not series.empty else np.nan,
+                "Median Forward Return %": float(series.median()) if not series.empty else np.nan,
+                "Win Rate %": float((series > 0).mean() * 100) if not series.empty else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def create_horizon_comparison_chart(actionable_history: pd.DataFrame) -> go.Figure:
+    """Compare forward-return distributions across 5, 10, and 20 bars."""
+    fig = go.Figure()
+    colors = {5: "#38bdf8", 10: "#f59e0b", 20: "#22c55e"}
+    for horizon in (5, 10, 20):
+        forward_column = get_forward_return_column(horizon)
+        series = actionable_history[forward_column].dropna()
+        if series.empty:
+            continue
+        fig.add_trace(
+            go.Box(
+                y=series,
+                name=f"{horizon} bars",
+                boxmean=True,
+                marker_color=colors[horizon],
+            )
+        )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#f87171")
+    fig.update_layout(
+        title="Forward Return Comparison by Horizon",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=60, b=30, l=40, r=30),
+        yaxis_title="Directional Forward Return %",
+        xaxis_title="Horizon",
+        showlegend=False,
+    )
+    return fig
+
+
+def build_regime_performance_table(actionable_history: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Aggregate directional signal performance by detected regime."""
+    forward_column = get_forward_return_column(horizon)
+    rows = []
+    for regime, regime_history in actionable_history.groupby("regime"):
+        series = regime_history[forward_column].dropna()
+        if series.empty:
+            continue
+        rows.append(
+            {
+                "Regime": regime,
+                "Actionable Signals": int(len(series)),
+                "Average Forward Return %": float(series.mean()),
+                "Median Forward Return %": float(series.median()),
+                "Win Rate %": float((series > 0).mean() * 100),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("Median Forward Return %", ascending=False)
+
+
+def create_regime_performance_chart(regime_table: pd.DataFrame, horizon: int) -> go.Figure:
+    """Visualize average and median returns by regime."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=regime_table["Regime"],
+            y=regime_table["Average Forward Return %"],
+            name=f"Average ({horizon} bars)",
+            marker_color="#38bdf8",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=regime_table["Regime"],
+            y=regime_table["Median Forward Return %"],
+            name=f"Median ({horizon} bars)",
+            marker_color="#22c55e",
+        )
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#f87171")
+    fig.update_layout(
+        title=f"Performance by Regime ({horizon}-Bar Horizon)",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=60, b=30, l=40, r=30),
+        yaxis_title="Directional Forward Return %",
+        xaxis_title="Regime",
+        barmode="group",
+    )
+    return fig
+
+
+def bucket_score(value: float) -> str:
+    """Bucket score values for validation of the scoring model."""
+    if pd.isna(value):
+        return "N/A"
+    if value <= -2:
+        return "<= -2"
+    if value < -1:
+        return "-2 to -1"
+    if value < 1:
+        return "-1 to 1"
+    if value < 2:
+        return "1 to 2"
+    return ">= 2"
+
+
+def build_score_bucket_table(actionable_history: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """Aggregate directional performance by score bucket."""
+    forward_column = get_forward_return_column(horizon)
+    bucket_history = actionable_history.copy()
+    bucket_history["Score Bucket"] = bucket_history["score"].apply(bucket_score)
+    order = ["<= -2", "-2 to -1", "-1 to 1", "1 to 2", ">= 2"]
+    rows = []
+    for label in order:
+        bucket_rows = bucket_history[bucket_history["Score Bucket"] == label]
+        series = bucket_rows[forward_column].dropna()
+        if series.empty:
+            continue
+        rows.append(
+            {
+                "Score Bucket": label,
+                "Actionable Signals": int(len(series)),
+                "Average Forward Return %": float(series.mean()),
+                "Median Forward Return %": float(series.median()),
+                "Win Rate %": float((series > 0).mean() * 100),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def create_score_bucket_chart(score_table: pd.DataFrame, horizon: int) -> go.Figure:
+    """Visualize average and median performance by score bucket."""
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=score_table["Score Bucket"],
+            y=score_table["Average Forward Return %"],
+            name=f"Average ({horizon} bars)",
+            marker_color="#f59e0b",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=score_table["Score Bucket"],
+            y=score_table["Median Forward Return %"],
+            name=f"Median ({horizon} bars)",
+            marker_color="#8b5cf6",
+        )
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#f87171")
+    fig.update_layout(
+        title=f"Performance by Score Bucket ({horizon}-Bar Horizon)",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=60, b=30, l=40, r=30),
+        yaxis_title="Directional Forward Return %",
+        xaxis_title="Score Bucket",
+        barmode="group",
+    )
+    return fig
+
+
+def build_best_worst_signal_tables(actionable_history: pd.DataFrame, horizon: int, limit: int = 5) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the strongest and weakest directional signals for a chosen horizon."""
+    forward_column = get_forward_return_column(horizon)
+    display_history = actionable_history.reset_index().copy()
+    if "date" not in display_history.columns:
+        display_history = display_history.rename(columns={display_history.columns[0]: "date"})
+
+    display_history["date"] = pd.to_datetime(display_history["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    display_history["close"] = display_history["close"].map(lambda value: f"${value:,.2f}")
+    display_history["score"] = display_history["score"].map(lambda value: f"{value:+.2f}")
+    display_history[forward_column] = display_history[forward_column].map(lambda value: f"{value:.2f}%")
+
+    columns = ["date", "signal", "close", "score", "regime", "signal_style", forward_column]
+    sort_history = actionable_history.reset_index().copy()
+    if "date" not in sort_history.columns:
+        sort_history = sort_history.rename(columns={sort_history.columns[0]: "date"})
+
+    top_rows = sort_history.nlargest(limit, forward_column)
+    worst_rows = sort_history.nsmallest(limit, forward_column)
+
+    top_display = display_history.set_index("date").reindex(top_rows["date"].dt.strftime("%Y-%m-%d")).reset_index()[columns]
+    worst_display = display_history.set_index("date").reindex(worst_rows["date"].dt.strftime("%Y-%m-%d")).reset_index()[columns]
+    return top_display, worst_display
+
+
+def build_backtest_interpretations(backtest_results: dict, horizon: int, strategy_total_return: float | None) -> list[str]:
+    """Create concise, plain-English interpretation labels for the backtest summary."""
+    total_signals = int(backtest_results.get("total_signals", 0))
+    average_return = float(backtest_results.get(f"average_forward_return_{horizon}", 0.0))
+    median_return = float(backtest_results.get(f"median_forward_return_{horizon}", 0.0))
+    max_drawdown = abs(float(backtest_results.get("max_drawdown", 0.0)))
+
+    lines = []
+    if total_signals < MIN_BACKTEST_CONFIDENCE_SIGNALS:
+        lines.append(
+            f"Low confidence: only {total_signals} actionable signals were generated, so the sample is small and not statistically meaningful."
+        )
+    if median_return > 0:
+        lines.append(
+            f"Positive edge: the median directional forward return at {horizon} bars is {median_return:.2f}%, so the typical signal outcome was favorable."
+        )
+    elif average_return > 0 and median_return <= 0:
+        lines.append(
+            f"Weak / mixed: the average {horizon}-bar directional return is {average_return:.2f}%, but the median is {median_return:.2f}%, so a few outliers may be carrying the result."
+        )
+    else:
+        lines.append(
+            f"Mixed / negative: the median directional forward return at {horizon} bars is {median_return:.2f}%, so the typical signal did not show a strong edge."
+        )
+    if strategy_total_return is not None and max_drawdown > max(10.0, abs(strategy_total_return) * 0.75):
+        lines.append(
+            f"High drawdown: the approximate signal-equity drawdown reached {backtest_results['max_drawdown']:.2f}% while the approximate strategy return was {strategy_total_return:.2f}%."
+        )
+    return lines
+
+
 def create_price_chart(
     df: pd.DataFrame,
     ticker: str,
@@ -343,6 +697,8 @@ def create_price_chart(
     ema_period: int | None = None,
     actionable_levels=None,
     historical_levels=None,
+    buy_markers: pd.DataFrame | None = None,
+    sell_markers: pd.DataFrame | None = None,
 ):
     """Create a candlestick chart with overlays, volume, and support/resistance zones."""
     close_series = get_series(df, "Close")
@@ -446,6 +802,34 @@ def create_price_chart(
             line_dash="dot",
             line_color=line_color,
             line_width=1,
+            row=1,
+            col=1,
+        )
+
+    if buy_markers is not None and not buy_markers.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=buy_markers["date"],
+                y=buy_markers["close"],
+                mode="markers",
+                name="Backtest BUY",
+                marker=dict(symbol="triangle-up", size=11, color="#22c55e", line=dict(color="#052e16", width=1)),
+                hovertemplate="BUY<br>%{x|%Y-%m-%d}<br>$%{y:,.2f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+
+    if sell_markers is not None and not sell_markers.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sell_markers["date"],
+                y=sell_markers["close"],
+                mode="markers",
+                name="Backtest SELL",
+                marker=dict(symbol="triangle-down", size=11, color="#ef4444", line=dict(color="#450a0a", width=1)),
+                hovertemplate="SELL<br>%{x|%Y-%m-%d}<br>$%{y:,.2f}<extra></extra>",
+            ),
             row=1,
             col=1,
         )
@@ -903,6 +1287,12 @@ def main():
     st.sidebar.header("Signal Engine")
     use_transparent_signals = st.sidebar.checkbox("Use regime-based rule engine", value=True, help=get_help_text("use_regime_engine"))
     show_backtest = st.sidebar.checkbox("Show historical backtest", value=True, help=get_help_text("show_backtest"))
+    show_backtest_signals_on_chart = st.sidebar.checkbox(
+        "Show backtest signals on chart",
+        value=False,
+        disabled=not show_backtest,
+        help="Overlay BUY and SELL markers from the historical backtest on the price chart. Disabled automatically when historical backtest is turned off.",
+    )
 
     st.sidebar.divider()
     st.sidebar.header("VCP Detector")
@@ -1257,6 +1647,61 @@ def main():
         exhaustion_table = build_wills_signal_table(wills_exhaustion_result, first_column_label="Category")
         st.table(exhaustion_table)
 
+        backtest_results = None
+        backtest_signal_history = pd.DataFrame()
+        actionable_signal_history = pd.DataFrame()
+        backtest_equity_frame = pd.DataFrame()
+        backtest_missing_columns: list[str] = []
+        backtest_skip_reason = None
+        backtest_marker_warning = None
+        chart_buy_markers = pd.DataFrame()
+        chart_sell_markers = pd.DataFrame()
+
+        if show_backtest:
+            if len(df) > MAX_BACKTEST_ROWS:
+                backtest_skip_reason = (
+                    f"Backtest skipped for performance safety because the dataset has {len(df)} rows, "
+                    f"which exceeds the {MAX_BACKTEST_ROWS}-row guardrail."
+                )
+            elif is_intraday_interval(interval):
+                backtest_skip_reason = "Backtest is disabled for intraday intervals in this deployment-oriented build to avoid heavy Community Cloud workloads."
+            else:
+                with st.spinner("Running backtest..."):
+                    started_at = perf_counter()
+                    backtest_results = backtest_cached(
+                        df=df,
+                        ticker=ticker,
+                        max_levels=zone_count,
+                        swing_sensitivity=swing_sensitivity,
+                        enable_vcp_detection=enable_vcp_detection and not bool(vcp_skip_reason),
+                        vcp_min_base_length=vcp_min_base_length,
+                        vcp_max_base_length=vcp_max_base_length,
+                        interval=interval,
+                    )
+                    record_timing("Historical backtest", started_at)
+
+                backtest_signal_history = backtest_results.get("signal_history", pd.DataFrame())
+                if not backtest_signal_history.empty:
+                    backtest_missing_columns = validate_backtest_signal_history(backtest_signal_history)
+                    if not backtest_missing_columns:
+                        actionable_signal_history = get_actionable_signal_history(backtest_signal_history)
+                        backtest_equity_frame = build_backtest_equity_frame(df, backtest_signal_history)
+
+                        if show_backtest_signals_on_chart:
+                            if actionable_signal_history.empty:
+                                backtest_marker_warning = "No actionable BUY or SELL rows were available to overlay on the price chart."
+                            elif len(actionable_signal_history) > MAX_BACKTEST_SIGNAL_MARKERS:
+                                backtest_marker_warning = (
+                                    f"Backtest chart markers were hidden because {len(actionable_signal_history)} actionable signals would clutter the chart. "
+                                    "Use the tables below for detailed signal-by-signal review."
+                                )
+                            else:
+                                marker_history = actionable_signal_history.reset_index().copy()
+                                if "date" not in marker_history.columns:
+                                    marker_history = marker_history.rename(columns={marker_history.columns[0]: "date"})
+                                chart_buy_markers = marker_history[marker_history["signal"] == "BUY"][["date", "close"]]
+                                chart_sell_markers = marker_history[marker_history["signal"] == "SELL"][["date", "close"]]
+
         started_at = perf_counter()
         chart = create_price_chart(
             df,
@@ -1265,9 +1710,13 @@ def main():
             ema_period=ema_period if ema_enabled else None,
             actionable_levels=support_levels + resistance_levels if show_zones else None,
             historical_levels=historical_levels,
+            buy_markers=chart_buy_markers,
+            sell_markers=chart_sell_markers,
         )
         record_timing("Chart rendering", started_at)
         st.plotly_chart(chart, use_container_width=True)
+        if backtest_marker_warning:
+            st.warning(backtest_marker_warning)
 
         with st.expander("Support/Resistance Methodology"):
             st.write("Levels are automatically detected from swing highs and swing lows.")
@@ -1310,61 +1759,201 @@ def main():
 
         if show_backtest:
             st.divider()
-            st.subheader("Historical Backtest")
+            st.subheader("Backtest Results")
             st.caption("Historical backtest uses only information available up to each historical date. No look-ahead data is used.")
             st.caption("Exploratory backtest only. It does not include trading costs, slippage, taxes, or execution risk.")
             st.caption("When enabled, VCP is treated as a supporting factor, not a standalone trade instruction.")
-            backtest_skip_reason = None
-            if len(df) > MAX_BACKTEST_ROWS:
-                backtest_skip_reason = (
-                    f"Backtest skipped for performance safety because the dataset has {len(df)} rows, "
-                    f"which exceeds the {MAX_BACKTEST_ROWS}-row guardrail."
-                )
-            elif is_intraday_interval(interval):
-                backtest_skip_reason = "Backtest is disabled for intraday intervals in this deployment-oriented build to avoid heavy Community Cloud workloads."
 
             if backtest_skip_reason:
                 st.warning(backtest_skip_reason)
+            elif backtest_results is None:
+                st.info("Backtest results were not available for this run.")
+            elif backtest_signal_history.empty:
+                st.info("Backtest completed, but no signal-history rows were available to visualize.")
+            elif backtest_missing_columns:
+                st.warning(
+                    "Backtest results are missing required columns for the visualization layer: "
+                    + ", ".join(backtest_missing_columns)
+                )
             else:
-                with st.spinner("Running backtest..."):
-                    started_at = perf_counter()
-                    backtest_results = backtest_cached(
-                        df=df,
-                        ticker=ticker,
-                        max_levels=zone_count,
-                        swing_sensitivity=swing_sensitivity,
-                        enable_vcp_detection=enable_vcp_detection and not bool(vcp_skip_reason),
-                        vcp_min_base_length=vcp_min_base_length,
-                        vcp_max_base_length=vcp_max_base_length,
-                        interval=interval,
+                analysis_horizon = st.selectbox(
+                    "Detailed backtest analysis horizon",
+                    options=[5, 10, 20],
+                    index=1,
+                    key="backtest_analysis_horizon",
+                    help="Select which forward-return horizon to use for the distribution, regime, score-bucket, and best/worst signal analysis below.",
+                )
+                strategy_total_return = (
+                    float(backtest_equity_frame["Strategy Cumulative Return %"].iloc[-1])
+                    if not backtest_equity_frame.empty
+                    else None
+                )
+                drawdown_flag = (
+                    strategy_total_return is not None
+                    and abs(float(backtest_results["max_drawdown"])) > max(10.0, abs(strategy_total_return) * 0.75)
+                )
+                interpretation_lines = build_backtest_interpretations(
+                    backtest_results,
+                    horizon=analysis_horizon,
+                    strategy_total_return=strategy_total_return,
+                )
+                interpretation_message = "<ul style='margin:0;padding-left:1.1rem;'>" + "".join(
+                    f"<li>{escape(line)}</li>" for line in interpretation_lines
+                ) + "</ul>"
+                interpretation_accent = "#059669" if any(line.startswith("Positive edge") for line in interpretation_lines) else "#d97706"
+                render_callout_box("Backtest Interpretation", interpretation_message, interpretation_accent)
+
+                if int(backtest_results["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS:
+                    st.warning(
+                        f"Only {int(backtest_results['total_signals'])} actionable signals were generated. "
+                        "This sample is small and should not be treated as statistically meaningful."
                     )
-                    record_timing("Historical backtest", started_at)
+
+                st.markdown("#### Backtest Summary")
+                st.caption("These KPI cards summarize the existing signal-quality backtest. Interpretation labels are descriptive summaries, not investment advice.")
 
                 backtest_cols = st.columns(5)
-                metric_with_help(backtest_cols[0], "Total Signals", int(backtest_results["total_signals"]), help_key="total_signals")
+                metric_with_help(
+                    backtest_cols[0],
+                    "Total Actionable Signals",
+                    int(backtest_results["total_signals"]),
+                    delta="Low confidence sample" if int(backtest_results["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS else None,
+                    delta_color="off",
+                    help_key="total_signals",
+                )
                 metric_with_help(backtest_cols[1], "BUY Signals", int(backtest_results["buy_signals"]), help_key="buy_signals")
                 metric_with_help(backtest_cols[2], "SELL Signals", int(backtest_results["sell_signals"]), help_key="sell_signals")
                 metric_with_help(backtest_cols[3], "BUY Win Rate", f"{backtest_results['buy_win_rate']:.1f}%", help_key="buy_win_rate")
                 metric_with_help(backtest_cols[4], "SELL Win Rate", f"{backtest_results['sell_win_rate']:.1f}%", help_key="sell_win_rate")
 
                 avg_cols = st.columns(3)
-                metric_with_help(avg_cols[0], "Avg Forward Return (5)", f"{backtest_results['average_forward_return_5']:.2f}%", help_key="average_forward_return")
-                metric_with_help(avg_cols[1], "Avg Forward Return (10)", f"{backtest_results['average_forward_return_10']:.2f}%", help_key="average_forward_return")
-                metric_with_help(avg_cols[2], "Avg Forward Return (20)", f"{backtest_results['average_forward_return_20']:.2f}%", help_key="average_forward_return")
+                for index, horizon in enumerate((5, 10, 20)):
+                    average_value = float(backtest_results[f"average_forward_return_{horizon}"])
+                    median_value = float(backtest_results[f"median_forward_return_{horizon}"])
+                    avg_delta = "Weak / mixed" if average_value > 0 and median_value <= 0 else None
+                    metric_with_help(
+                        avg_cols[index],
+                        f"Avg Forward Return ({horizon})",
+                        f"{average_value:.2f}%",
+                        delta=avg_delta,
+                        delta_color="off",
+                        help_key="average_forward_return",
+                    )
 
                 median_cols = st.columns(3)
-                metric_with_help(median_cols[0], "Median Forward Return (5)", f"{backtest_results['median_forward_return_5']:.2f}%", help_key="median_forward_return")
-                metric_with_help(median_cols[1], "Median Forward Return (10)", f"{backtest_results['median_forward_return_10']:.2f}%", help_key="median_forward_return")
-                metric_with_help(median_cols[2], "Median Forward Return (20)", f"{backtest_results['median_forward_return_20']:.2f}%", help_key="median_forward_return")
+                for index, horizon in enumerate((5, 10, 20)):
+                    median_value = float(backtest_results[f"median_forward_return_{horizon}"])
+                    median_delta = "Positive edge" if median_value > 0 else None
+                    metric_with_help(
+                        median_cols[index],
+                        f"Median Forward Return ({horizon})",
+                        f"{median_value:.2f}%",
+                        delta=median_delta,
+                        delta_color="off",
+                        help_key="median_forward_return",
+                    )
 
-                risk_cols = st.columns(2)
-                metric_with_help(risk_cols[0], "Signal Equity Max Drawdown", f"{backtest_results['max_drawdown']:.2f}%", help_key="signal_equity_drawdown")
+                risk_cols = st.columns(3)
+                metric_with_help(
+                    risk_cols[0],
+                    "Signal Equity Max Drawdown",
+                    f"{backtest_results['max_drawdown']:.2f}%",
+                    delta="High drawdown" if drawdown_flag else None,
+                    delta_color="off",
+                    help_key="signal_equity_drawdown",
+                )
                 metric_with_help(risk_cols[1], "Buy-and-Hold Return", f"{backtest_results['buy_and_hold_return']:.2f}%", help_key="buy_and_hold_return")
+                metric_with_help(risk_cols[2], "Bars Used", str(int(backtest_results["bars_used"])), help_key="bars_used")
 
-                consistency_cols = st.columns(3)
+                consistency_cols = st.columns(2)
                 metric_with_help(consistency_cols[0], "Backtest Start Price", format_money(backtest_results["start_price"]), help_key="start_price")
                 metric_with_help(consistency_cols[1], "Backtest End Price", format_money(backtest_results["end_price"]), help_key="end_price")
-                metric_with_help(consistency_cols[2], "Backtest Bars Used", str(int(backtest_results["bars_used"])), help_key="bars_used")
+
+                if actionable_signal_history.empty:
+                    st.info("No actionable BUY or SELL signals were available in the current backtest window, so the detailed analysis views are hidden.")
+                else:
+                    if not backtest_equity_frame.empty:
+                        st.markdown("#### Equity Curve")
+                        st.caption("Approximate rule-based strategy simulation using the existing backtest `position` series. This is not a brokerage-accurate trade simulator.")
+                        st.plotly_chart(create_backtest_equity_chart(backtest_equity_frame), use_container_width=True)
+
+                    detail_cols = st.columns(2)
+                    analysis_history = get_actionable_signal_history(backtest_signal_history, analysis_horizon)
+                    if analysis_history.empty:
+                        st.warning(
+                            f"No actionable signals had valid forward returns at the selected {analysis_horizon}-bar horizon."
+                        )
+                    else:
+                        with detail_cols[0]:
+                            st.markdown("#### Forward Return Distribution")
+                            st.plotly_chart(
+                                create_forward_return_histogram(analysis_history, analysis_horizon),
+                                use_container_width=True,
+                            )
+                            st.caption("Returns to the right of 0% were favorable to the signal direction.")
+
+                        with detail_cols[1]:
+                            st.markdown("#### Horizon Comparison")
+                            st.plotly_chart(
+                                create_horizon_comparison_chart(actionable_signal_history),
+                                use_container_width=True,
+                            )
+                            horizon_table = build_horizon_comparison_table(actionable_signal_history).round(2)
+                            st.dataframe(horizon_table, hide_index=True, use_container_width=True)
+                            valid_horizon_table = horizon_table.dropna(subset=["Median Forward Return %"])
+                            if not valid_horizon_table.empty:
+                                best_horizon_row = valid_horizon_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
+                                st.caption(
+                                    f"On a median basis, the signals looked strongest over {best_horizon_row['Horizon']} "
+                                    f"with a median directional return of {best_horizon_row['Median Forward Return %']:.2f}%."
+                                )
+
+                        with st.expander("Performance by Regime", expanded=False):
+                            regime_table = build_regime_performance_table(analysis_history, analysis_horizon).round(2)
+                            if regime_table.empty:
+                                st.info("No regime-level performance rows were available for the selected horizon.")
+                            else:
+                                st.dataframe(regime_table, hide_index=True, use_container_width=True)
+                                st.plotly_chart(
+                                    create_regime_performance_chart(regime_table, analysis_horizon),
+                                    use_container_width=True,
+                                )
+                                best_regime = regime_table.iloc[0]
+                                st.caption(
+                                    f"At the {analysis_horizon}-bar horizon, {best_regime['Regime']} produced the strongest median directional return "
+                                    f"({best_regime['Median Forward Return %']:.2f}%) in this sample."
+                                )
+
+                        with st.expander("Performance by Score Bucket", expanded=False):
+                            score_bucket_table = build_score_bucket_table(analysis_history, analysis_horizon).round(2)
+                            if score_bucket_table.empty:
+                                st.info("No score-bucket rows were available for the selected horizon.")
+                            else:
+                                st.dataframe(score_bucket_table, hide_index=True, use_container_width=True)
+                                st.plotly_chart(
+                                    create_score_bucket_chart(score_bucket_table, analysis_horizon),
+                                    use_container_width=True,
+                                )
+                                strongest_bucket = score_bucket_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
+                                st.caption(
+                                    "A useful scoring model should usually show stronger directional outcomes in the more extreme score buckets than around neutral. "
+                                    f"In this sample, the best median outcome came from bucket {strongest_bucket['Score Bucket']} "
+                                    f"({strongest_bucket['Median Forward Return %']:.2f}%)."
+                                )
+
+                        with st.expander("Best and Worst Signals", expanded=False):
+                            top_signals, worst_signals = build_best_worst_signal_tables(analysis_history, analysis_horizon)
+                            st.markdown(f"**Top 5 Signals ({analysis_horizon}-Bar Forward Return)**")
+                            st.dataframe(top_signals, hide_index=True, use_container_width=True)
+                            st.markdown(f"**Worst 5 Signals ({analysis_horizon}-Bar Forward Return)**")
+                            st.dataframe(worst_signals, hide_index=True, use_container_width=True)
+
+                with st.expander("Backtest Limitations", expanded=False):
+                    st.write("- This is a signal-quality backtest, not a full brokerage-accurate simulation.")
+                    st.write("- It does not fully model commissions, slippage, bid/ask spread, taxes, liquidity, order execution, or real position sizing.")
+                    st.write("- BUY and SELL win rates are based on the first forward-return horizon unless a different horizon is shown in the detailed analysis views.")
+                    st.write("- A small number of signals is not statistically meaningful.")
+                    st.write("- Good historical results do not guarantee future performance.")
 
         st.divider()
         st.subheader("Actionable Support/Resistance Levels")
