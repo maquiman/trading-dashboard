@@ -10,7 +10,7 @@ from html import escape
 from pathlib import Path
 from time import perf_counter
 
-from backtest import backtest_signals_no_lookahead
+from backtest import backtest_signals_no_lookahead, backtest_wills_signal_no_lookahead
 from help_text import DASHBOARD_GUIDE, TOOLTIPS
 from levels import (
     build_level_snapshot,
@@ -43,6 +43,8 @@ MAX_BACKTEST_ROWS = 1800
 MIN_RELIABLE_VCP_ROWS = 80
 MIN_BACKTEST_CONFIDENCE_SIGNALS = 20
 MAX_BACKTEST_SIGNAL_MARKERS = 120
+DEFAULT_CLUSTER_GAP_BARS = 5
+DEFAULT_CLUSTER_COOLDOWN_BARS = 1
 
 
 def configure_yfinance_cache() -> None:
@@ -690,6 +692,196 @@ def build_backtest_interpretations(backtest_results: dict, horizon: int, strateg
     return lines
 
 
+def build_signal_clusters(
+    signal_history: pd.DataFrame,
+    cluster_gap_bars: int = DEFAULT_CLUSTER_GAP_BARS,
+    neutral_cooldown_bars: int = DEFAULT_CLUSTER_COOLDOWN_BARS,
+) -> pd.DataFrame:
+    """Collapse repeated same-direction signals into independent trade clusters."""
+    if signal_history is None or signal_history.empty or "signal" not in signal_history.columns:
+        return pd.DataFrame()
+
+    ordered = signal_history.reset_index().copy()
+    if "date" not in ordered.columns:
+        ordered = ordered.rename(columns={ordered.columns[0]: "date"})
+    ordered["row_number"] = np.arange(len(ordered))
+
+    cluster_rows = []
+    active_cluster = None
+    neutral_streak = 0
+
+    for row in ordered.to_dict("records"):
+        signal = row.get("signal")
+        row_number = int(row["row_number"])
+        if signal not in {"BUY", "SELL"}:
+            neutral_streak += 1
+            continue
+
+        start_new_cluster = False
+        if active_cluster is None:
+            start_new_cluster = True
+        else:
+            bars_since_last_actionable = row_number - int(active_cluster["last_actionable_row_number"])
+            if signal != active_cluster["signal"]:
+                start_new_cluster = True
+            elif neutral_streak >= neutral_cooldown_bars:
+                start_new_cluster = True
+            elif bars_since_last_actionable > cluster_gap_bars:
+                start_new_cluster = True
+
+        if start_new_cluster:
+            cluster_entry = dict(row)
+            cluster_entry["cluster_id"] = len(cluster_rows) + 1
+            cluster_entry["cluster_start_date"] = row["date"]
+            cluster_entry["cluster_end_date"] = row["date"]
+            cluster_entry["cluster_size"] = 1
+            cluster_entry["last_actionable_row_number"] = row_number
+            cluster_rows.append(cluster_entry)
+            active_cluster = cluster_rows[-1]
+        else:
+            active_cluster["cluster_end_date"] = row["date"]
+            active_cluster["cluster_size"] += 1
+            active_cluster["last_actionable_row_number"] = row_number
+
+        neutral_streak = 0
+
+    if not cluster_rows:
+        return pd.DataFrame()
+
+    cluster_history = pd.DataFrame(cluster_rows).drop(columns=["last_actionable_row_number", "row_number"], errors="ignore")
+    return cluster_history.set_index("date")
+
+
+def summarize_signal_history_view(signal_history: pd.DataFrame, primary_horizon: int = 5) -> dict:
+    """Summarize counts and directional forward returns for a chosen signal-history view."""
+    if signal_history is None or signal_history.empty:
+        return {
+            "total_signals": 0,
+            "buy_signals": 0,
+            "sell_signals": 0,
+            "buy_win_rate": 0.0,
+            "sell_win_rate": 0.0,
+            "average_forward_return_5": 0.0,
+            "average_forward_return_10": 0.0,
+            "average_forward_return_20": 0.0,
+            "median_forward_return_5": 0.0,
+            "median_forward_return_10": 0.0,
+            "median_forward_return_20": 0.0,
+        }
+
+    actionable = signal_history[signal_history["signal"].isin(["BUY", "SELL"])].copy()
+    summary = {
+        "total_signals": int(len(actionable)),
+        "buy_signals": int((actionable["signal"] == "BUY").sum()),
+        "sell_signals": int((actionable["signal"] == "SELL").sum()),
+    }
+
+    for horizon in (5, 10, 20):
+        forward_column = get_forward_return_column(horizon)
+        series = actionable[forward_column].dropna() if forward_column in actionable.columns else pd.Series(dtype=float)
+        summary[f"average_forward_return_{horizon}"] = float(series.mean()) if not series.empty else 0.0
+        summary[f"median_forward_return_{horizon}"] = float(series.median()) if not series.empty else 0.0
+
+    primary_column = get_forward_return_column(primary_horizon)
+    buy_series = actionable.loc[actionable["signal"] == "BUY", primary_column].dropna() if primary_column in actionable.columns else pd.Series(dtype=float)
+    sell_series = actionable.loc[actionable["signal"] == "SELL", primary_column].dropna() if primary_column in actionable.columns else pd.Series(dtype=float)
+    summary["buy_win_rate"] = float((buy_series > 0).mean() * 100) if not buy_series.empty else 0.0
+    summary["sell_win_rate"] = float((sell_series > 0).mean() * 100) if not sell_series.empty else 0.0
+    return summary
+
+
+def build_backtest_summary_metrics(backtest_results: dict, signal_view: pd.DataFrame, primary_horizon: int = 5) -> dict:
+    """Combine strategy-level metrics with counts/returns from a daily or clustered signal view."""
+    summary = summarize_signal_history_view(signal_view, primary_horizon=primary_horizon)
+    summary.update(
+        {
+            "engine_name": backtest_results.get("engine_name", "Backtest Engine"),
+            "max_drawdown": float(backtest_results.get("max_drawdown", 0.0)),
+            "strategy_return": float(backtest_results.get("strategy_return", 0.0)),
+            "buy_and_hold_return": float(backtest_results.get("buy_and_hold_return", 0.0)),
+            "start_price": float(backtest_results.get("start_price", 0.0)),
+            "end_price": float(backtest_results.get("end_price", 0.0)),
+            "bars_used": int(backtest_results.get("bars_used", 0)),
+        }
+    )
+    return summary
+
+
+def create_equity_comparison_chart(engine_equity_frames: dict[str, pd.DataFrame]) -> go.Figure:
+    """Compare buy-and-hold with one or more strategy equity curves."""
+    fig = go.Figure()
+    strategy_colors = {
+        "Main Signal Engine": "#38bdf8",
+        "Will's Signal": "#22c55e",
+    }
+    buy_hold_drawn = False
+
+    for engine_name, equity_frame in engine_equity_frames.items():
+        if equity_frame is None or equity_frame.empty:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=equity_frame.index,
+                y=equity_frame["Strategy Cumulative Return %"],
+                mode="lines",
+                name=f"{engine_name} strategy",
+                line=dict(color=strategy_colors.get(engine_name, "#e879f9"), width=3),
+            )
+        )
+        if not buy_hold_drawn:
+            fig.add_trace(
+                go.Scatter(
+                    x=equity_frame.index,
+                    y=equity_frame["Buy-and-Hold Return %"],
+                    mode="lines",
+                    name="Buy-and-hold",
+                    line=dict(color="#f59e0b", width=2, dash="dash"),
+                )
+            )
+            buy_hold_drawn = True
+
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(226,232,240,0.45)")
+    fig.update_layout(
+        title="Equity Curve Comparison",
+        template="plotly_dark",
+        height=430,
+        margin=dict(t=60, b=30, l=40, r=30),
+        yaxis_title="Cumulative Return %",
+        xaxis_title="Date",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def detect_top_signal_concentration_warning(signal_history: pd.DataFrame, horizon: int, top_n: int = 5) -> str | None:
+    """Warn when the strongest signals cluster into a very short event window."""
+    if signal_history is None or signal_history.empty:
+        return None
+    forward_column = get_forward_return_column(horizon)
+    if forward_column not in signal_history.columns:
+        return None
+
+    actionable = get_actionable_signal_history(signal_history, horizon)
+    if len(actionable) < top_n:
+        return None
+
+    top_rows = actionable.nlargest(top_n, forward_column).reset_index()
+    if "date" not in top_rows.columns:
+        top_rows = top_rows.rename(columns={top_rows.columns[0]: "date"})
+    date_series = pd.to_datetime(top_rows["date"], errors="coerce").dropna().sort_values()
+    if len(date_series) < top_n:
+        return None
+
+    span_days = int((date_series.iloc[-1] - date_series.iloc[0]).days)
+    if span_days <= 30:
+        return (
+            f"Top {top_n} signals at the {horizon}-bar horizon were concentrated within {span_days} calendar days. "
+            "Performance may depend heavily on one market event or short market phase."
+        )
+    return None
+
+
 def create_price_chart(
     df: pd.DataFrame,
     ticker: str,
@@ -1218,6 +1410,44 @@ def backtest_cached(
     return backtest_eod_cached(df, ticker, max_levels, swing_sensitivity, enable_vcp_detection, vcp_min_base_length, vcp_max_base_length)
 
 
+def _backtest_wills_cached_impl(
+    df: pd.DataFrame,
+    ticker: str,
+    buy_threshold: int,
+    sell_threshold: int,
+    exhaustion_sell_threshold: int,
+) -> dict:
+    return backtest_wills_signal_no_lookahead(
+        df=df,
+        ticker=ticker,
+        lookback_periods=(5, 10, 20),
+        buy_threshold=buy_threshold,
+        sell_threshold=sell_threshold,
+        exhaustion_sell_threshold=exhaustion_sell_threshold,
+    )
+
+
+@st.cache_data(ttl=DAILY_CACHE_TTL_SECONDS, show_spinner=False)
+def backtest_wills_daily_cached(
+    df: pd.DataFrame,
+    ticker: str,
+    buy_threshold: int,
+    sell_threshold: int,
+    exhaustion_sell_threshold: int,
+) -> dict:
+    return _backtest_wills_cached_impl(df, ticker, buy_threshold, sell_threshold, exhaustion_sell_threshold)
+
+
+def backtest_wills_cached(
+    df: pd.DataFrame,
+    ticker: str,
+    buy_threshold: int,
+    sell_threshold: int,
+    exhaustion_sell_threshold: int,
+) -> dict:
+    return backtest_wills_daily_cached(df, ticker, buy_threshold, sell_threshold, exhaustion_sell_threshold)
+
+
 @st.cache_data(ttl=DAILY_CACHE_TTL_SECONDS, show_spinner=False)
 def get_latest_available_market_date_cached(probe_ticker: str = "SPY") -> date:
     """Use a short period query to find a sensible default market date."""
@@ -1302,6 +1532,22 @@ def main():
     vcp_min_base_length = st.sidebar.slider("VCP base min length", min_value=20, max_value=80, value=20, help=get_help_text("vcp_base_min_length"))
     vcp_max_base_length = st.sidebar.slider("VCP base max length", min_value=40, max_value=180, value=120, help=get_help_text("vcp_base_max_length"))
 
+    st.session_state.setdefault("backtest_engine_mode", "Main Signal Engine")
+    st.session_state.setdefault("wills_backtest_buy_threshold", 7)
+    st.session_state.setdefault("wills_backtest_sell_threshold", 3)
+    st.session_state.setdefault("wills_backtest_exhaustion_sell_threshold", 6)
+    st.session_state.setdefault("backtest_signal_counting_mode", "Daily signals")
+    st.session_state.setdefault("backtest_cluster_gap_bars", DEFAULT_CLUSTER_GAP_BARS)
+    st.session_state.setdefault("backtest_cluster_cooldown_bars", DEFAULT_CLUSTER_COOLDOWN_BARS)
+
+    backtest_engine_mode = st.session_state.get("backtest_engine_mode", "Main Signal Engine")
+    wills_buy_threshold = int(st.session_state.get("wills_backtest_buy_threshold", 7))
+    wills_sell_threshold = int(st.session_state.get("wills_backtest_sell_threshold", 3))
+    wills_exhaustion_sell_threshold = int(st.session_state.get("wills_backtest_exhaustion_sell_threshold", 6))
+    signal_counting_mode = st.session_state.get("backtest_signal_counting_mode", "Daily signals")
+    cluster_gap_bars = int(st.session_state.get("backtest_cluster_gap_bars", DEFAULT_CLUSTER_GAP_BARS))
+    cluster_cooldown_bars = int(st.session_state.get("backtest_cluster_cooldown_bars", DEFAULT_CLUSTER_COOLDOWN_BARS))
+
     if start_date >= end_date:
         st.error("Start date must be before end date.")
         return
@@ -1314,6 +1560,12 @@ def main():
 
     try:
         status_warnings = list(selection_warnings)
+        if wills_buy_threshold <= wills_sell_threshold:
+            adjusted_buy_threshold = wills_sell_threshold + 1
+            status_warnings.append(
+                f"Will's Signal backtest buy threshold was adjusted to {adjusted_buy_threshold} so it stays above the sell threshold of {wills_sell_threshold}."
+            )
+            wills_buy_threshold = adjusted_buy_threshold
 
         with st.spinner(f"Loading data for {ticker}..."):
             started_at = perf_counter()
@@ -1647,60 +1899,127 @@ def main():
         exhaustion_table = build_wills_signal_table(wills_exhaustion_result, first_column_label="Category")
         st.table(exhaustion_table)
 
-        backtest_results = None
-        backtest_signal_history = pd.DataFrame()
-        actionable_signal_history = pd.DataFrame()
-        backtest_equity_frame = pd.DataFrame()
-        backtest_missing_columns: list[str] = []
-        backtest_skip_reason = None
+        backtest_results_by_engine: dict[str, dict] = {}
+        backtest_signal_history_by_engine: dict[str, pd.DataFrame] = {}
+        actionable_signal_history_by_engine: dict[str, pd.DataFrame] = {}
+        cluster_signal_history_by_engine: dict[str, pd.DataFrame] = {}
+        backtest_equity_frames: dict[str, pd.DataFrame] = {}
+        backtest_missing_columns_by_engine: dict[str, list[str]] = {}
+        backtest_skip_reason_by_engine: dict[str, str] = {}
         backtest_marker_warning = None
         chart_buy_markers = pd.DataFrame()
         chart_sell_markers = pd.DataFrame()
 
         if show_backtest:
-            if len(df) > MAX_BACKTEST_ROWS:
-                backtest_skip_reason = (
-                    f"Backtest skipped for performance safety because the dataset has {len(df)} rows, "
-                    f"which exceeds the {MAX_BACKTEST_ROWS}-row guardrail."
-                )
-            elif is_intraday_interval(interval):
-                backtest_skip_reason = "Backtest is disabled for intraday intervals in this deployment-oriented build to avoid heavy Community Cloud workloads."
-            else:
-                with st.spinner("Running backtest..."):
-                    started_at = perf_counter()
-                    backtest_results = backtest_cached(
-                        df=df,
-                        ticker=ticker,
-                        max_levels=zone_count,
-                        swing_sensitivity=swing_sensitivity,
-                        enable_vcp_detection=enable_vcp_detection and not bool(vcp_skip_reason),
-                        vcp_min_base_length=vcp_min_base_length,
-                        vcp_max_base_length=vcp_max_base_length,
-                        interval=interval,
+            engines_to_run = []
+            if backtest_engine_mode in {"Main Signal Engine", "Compare Both"}:
+                engines_to_run.append("Main Signal Engine")
+            if backtest_engine_mode in {"Will's Signal", "Compare Both"}:
+                engines_to_run.append("Will's Signal")
+
+            for engine_name in engines_to_run:
+                if engine_name == "Main Signal Engine":
+                    if len(df) > MAX_BACKTEST_ROWS:
+                        backtest_skip_reason_by_engine[engine_name] = (
+                            f"Backtest skipped for performance safety because the dataset has {len(df)} rows, "
+                            f"which exceeds the {MAX_BACKTEST_ROWS}-row guardrail."
+                        )
+                        continue
+                    if is_intraday_interval(interval):
+                        backtest_skip_reason_by_engine[engine_name] = (
+                            "Main Signal Engine backtest is disabled for intraday intervals in this deployment-oriented build "
+                            "to avoid heavy Community Cloud workloads."
+                        )
+                        continue
+
+                    with st.spinner("Running Main Signal Engine backtest..."):
+                        started_at = perf_counter()
+                        backtest_results = backtest_cached(
+                            df=df,
+                            ticker=ticker,
+                            max_levels=zone_count,
+                            swing_sensitivity=swing_sensitivity,
+                            enable_vcp_detection=enable_vcp_detection and not bool(vcp_skip_reason),
+                            vcp_min_base_length=vcp_min_base_length,
+                            vcp_max_base_length=vcp_max_base_length,
+                            interval=interval,
+                        )
+                        record_timing("Historical backtest - Main Signal Engine", started_at)
+
+                    signal_history = backtest_results.get("signal_history", pd.DataFrame())
+                    backtest_results_by_engine[engine_name] = backtest_results
+                    backtest_signal_history_by_engine[engine_name] = signal_history
+                    backtest_missing_columns_by_engine[engine_name] = validate_backtest_signal_history(signal_history) if not signal_history.empty else []
+                    if signal_history.empty or backtest_missing_columns_by_engine[engine_name]:
+                        continue
+
+                    actionable_signal_history_by_engine[engine_name] = get_actionable_signal_history(signal_history)
+                    cluster_signal_history_by_engine[engine_name] = build_signal_clusters(
+                        signal_history,
+                        cluster_gap_bars=cluster_gap_bars,
+                        neutral_cooldown_bars=cluster_cooldown_bars,
                     )
-                    record_timing("Historical backtest", started_at)
+                    backtest_equity_frames[engine_name] = build_backtest_equity_frame(df, signal_history)
 
-                backtest_signal_history = backtest_results.get("signal_history", pd.DataFrame())
-                if not backtest_signal_history.empty:
-                    backtest_missing_columns = validate_backtest_signal_history(backtest_signal_history)
-                    if not backtest_missing_columns:
-                        actionable_signal_history = get_actionable_signal_history(backtest_signal_history)
-                        backtest_equity_frame = build_backtest_equity_frame(df, backtest_signal_history)
+                elif engine_name == "Will's Signal":
+                    if daily_df.empty:
+                        backtest_skip_reason_by_engine[engine_name] = "Will's Signal backtest could not run because no daily helper data was available."
+                        continue
+                    if len(daily_df) > MAX_BACKTEST_ROWS:
+                        backtest_skip_reason_by_engine[engine_name] = (
+                            f"Will's Signal backtest skipped for performance safety because the daily dataset has {len(daily_df)} rows, "
+                            f"which exceeds the {MAX_BACKTEST_ROWS}-row guardrail."
+                        )
+                        continue
 
-                        if show_backtest_signals_on_chart:
-                            if actionable_signal_history.empty:
-                                backtest_marker_warning = "No actionable BUY or SELL rows were available to overlay on the price chart."
-                            elif len(actionable_signal_history) > MAX_BACKTEST_SIGNAL_MARKERS:
-                                backtest_marker_warning = (
-                                    f"Backtest chart markers were hidden because {len(actionable_signal_history)} actionable signals would clutter the chart. "
-                                    "Use the tables below for detailed signal-by-signal review."
-                                )
-                            else:
-                                marker_history = actionable_signal_history.reset_index().copy()
-                                if "date" not in marker_history.columns:
-                                    marker_history = marker_history.rename(columns={marker_history.columns[0]: "date"})
-                                chart_buy_markers = marker_history[marker_history["signal"] == "BUY"][["date", "close"]]
-                                chart_sell_markers = marker_history[marker_history["signal"] == "SELL"][["date", "close"]]
+                    with st.spinner("Running Will's Signal backtest..."):
+                        started_at = perf_counter()
+                        backtest_results = backtest_wills_cached(
+                            df=daily_df,
+                            ticker=ticker,
+                            buy_threshold=wills_buy_threshold,
+                            sell_threshold=wills_sell_threshold,
+                            exhaustion_sell_threshold=wills_exhaustion_sell_threshold,
+                        )
+                        record_timing("Historical backtest - Will's Signal", started_at)
+
+                    signal_history = backtest_results.get("signal_history", pd.DataFrame())
+                    backtest_results_by_engine[engine_name] = backtest_results
+                    backtest_signal_history_by_engine[engine_name] = signal_history
+                    backtest_missing_columns_by_engine[engine_name] = validate_backtest_signal_history(signal_history) if not signal_history.empty else []
+                    if signal_history.empty or backtest_missing_columns_by_engine[engine_name]:
+                        continue
+
+                    actionable_signal_history_by_engine[engine_name] = get_actionable_signal_history(signal_history)
+                    cluster_signal_history_by_engine[engine_name] = build_signal_clusters(
+                        signal_history,
+                        cluster_gap_bars=cluster_gap_bars,
+                        neutral_cooldown_bars=cluster_cooldown_bars,
+                    )
+                    backtest_equity_frames[engine_name] = build_backtest_equity_frame(daily_df, signal_history)
+
+            if show_backtest_signals_on_chart:
+                if backtest_engine_mode == "Compare Both":
+                    backtest_marker_warning = (
+                        "Backtest chart markers are hidden in Compare Both mode to avoid mixing two different engines on the same price chart."
+                    )
+                else:
+                    selected_history = actionable_signal_history_by_engine.get(backtest_engine_mode, pd.DataFrame())
+                    if backtest_engine_mode in backtest_skip_reason_by_engine:
+                        backtest_marker_warning = backtest_skip_reason_by_engine[backtest_engine_mode]
+                    elif selected_history.empty:
+                        backtest_marker_warning = "No actionable BUY or SELL rows were available to overlay on the price chart."
+                    elif len(selected_history) > MAX_BACKTEST_SIGNAL_MARKERS:
+                        backtest_marker_warning = (
+                            f"Backtest chart markers were hidden because {len(selected_history)} actionable signals would clutter the chart. "
+                            "Use the tables below for detailed signal-by-signal review."
+                        )
+                    else:
+                        marker_history = selected_history.reset_index().copy()
+                        if "date" not in marker_history.columns:
+                            marker_history = marker_history.rename(columns={marker_history.columns[0]: "date"})
+                        chart_buy_markers = marker_history[marker_history["signal"] == "BUY"][["date", "close"]]
+                        chart_sell_markers = marker_history[marker_history["signal"] == "SELL"][["date", "close"]]
 
         started_at = perf_counter()
         chart = create_price_chart(
@@ -1763,19 +2082,14 @@ def main():
             st.caption("Historical backtest uses only information available up to each historical date. No look-ahead data is used.")
             st.caption("Exploratory backtest only. It does not include trading costs, slippage, taxes, or execution risk.")
             st.caption("When enabled, VCP is treated as a supporting factor, not a standalone trade instruction.")
-
-            if backtest_skip_reason:
-                st.warning(backtest_skip_reason)
-            elif backtest_results is None:
-                st.info("Backtest results were not available for this run.")
-            elif backtest_signal_history.empty:
-                st.info("Backtest completed, but no signal-history rows were available to visualize.")
-            elif backtest_missing_columns:
-                st.warning(
-                    "Backtest results are missing required columns for the visualization layer: "
-                    + ", ".join(backtest_missing_columns)
+            control_cols = st.columns([1.3, 1.0, 1.0])
+            with control_cols[0]:
+                backtest_engine_mode = st.selectbox(
+                    "Backtest engine",
+                    options=["Main Signal Engine", "Will's Signal", "Compare Both"],
+                    key="backtest_engine_mode",
                 )
-            else:
+            with control_cols[1]:
                 analysis_horizon = st.selectbox(
                     "Detailed backtest analysis horizon",
                     options=[5, 10, 20],
@@ -1783,177 +2097,337 @@ def main():
                     key="backtest_analysis_horizon",
                     help="Select which forward-return horizon to use for the distribution, regime, score-bucket, and best/worst signal analysis below.",
                 )
-                strategy_total_return = (
-                    float(backtest_equity_frame["Strategy Cumulative Return %"].iloc[-1])
-                    if not backtest_equity_frame.empty
-                    else None
+            with control_cols[2]:
+                signal_counting_mode = st.selectbox(
+                    "Signal counting mode",
+                    options=["Daily signals", "Independent trade clusters"],
+                    key="backtest_signal_counting_mode",
+                    help="Daily signals count every actionable BUY or SELL row. Independent trade clusters collapse repeated same-direction signals into one trade idea.",
                 )
-                drawdown_flag = (
-                    strategy_total_return is not None
-                    and abs(float(backtest_results["max_drawdown"])) > max(10.0, abs(strategy_total_return) * 0.75)
-                )
-                interpretation_lines = build_backtest_interpretations(
-                    backtest_results,
-                    horizon=analysis_horizon,
-                    strategy_total_return=strategy_total_return,
-                )
-                interpretation_message = "<ul style='margin:0;padding-left:1.1rem;'>" + "".join(
-                    f"<li>{escape(line)}</li>" for line in interpretation_lines
-                ) + "</ul>"
-                interpretation_accent = "#059669" if any(line.startswith("Positive edge") for line in interpretation_lines) else "#d97706"
-                render_callout_box("Backtest Interpretation", interpretation_message, interpretation_accent)
 
-                if int(backtest_results["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS:
+            with st.expander("Backtest Settings", expanded=False):
+                cluster_cols = st.columns(2)
+                cluster_gap_bars = cluster_cols[0].number_input(
+                    "Cluster gap (bars)",
+                    min_value=1,
+                    max_value=30,
+                    value=DEFAULT_CLUSTER_GAP_BARS,
+                    key="backtest_cluster_gap_bars",
+                    help="If more than this many bars pass since the previous same-direction signal, the next same-direction signal starts a new cluster.",
+                )
+                cluster_cooldown_bars = cluster_cols[1].number_input(
+                    "Cluster cooldown (bars)",
+                    min_value=1,
+                    max_value=20,
+                    value=DEFAULT_CLUSTER_COOLDOWN_BARS,
+                    key="backtest_cluster_cooldown_bars",
+                    help="If the signal returns to HOLD or neutral for at least this many bars, the next actionable signal starts a new cluster.",
+                )
+                if backtest_engine_mode in {"Will's Signal", "Compare Both"}:
+                    threshold_cols = st.columns(3)
+                    wills_buy_threshold = threshold_cols[0].number_input(
+                        "Will BUY score",
+                        min_value=4,
+                        max_value=10,
+                        value=7,
+                        key="wills_backtest_buy_threshold",
+                        help="Will's Signal backtest issues a BUY when the bullish score is at or above this level, unless exhaustion overrides it.",
+                    )
+                    wills_sell_threshold = threshold_cols[1].number_input(
+                        "Will SELL / EXIT score",
+                        min_value=0,
+                        max_value=6,
+                        value=3,
+                        key="wills_backtest_sell_threshold",
+                        help="Will's Signal backtest issues a SELL / EXIT when the bullish score falls to or below this level.",
+                    )
+                    wills_exhaustion_sell_threshold = threshold_cols[2].number_input(
+                        "Will exhaustion SELL threshold",
+                        min_value=4,
+                        max_value=10,
+                        value=6,
+                        key="wills_backtest_exhaustion_sell_threshold",
+                        help="Will's Signal backtest also issues a SELL / EXIT when the exhaustion score reaches this level.",
+                    )
+                    st.caption(
+                        f"Will's Signal backtest rules: BUY if score >= {wills_buy_threshold}. "
+                        f"SELL / EXIT if score <= {wills_sell_threshold} or Will's Exhaustion Signal >= {wills_exhaustion_sell_threshold}. "
+                        "Otherwise HOLD."
+                    )
+
+            engine_label = backtest_engine_mode if backtest_engine_mode != "Compare Both" else "Comparison"
+            metric_with_help(st, "Backtest Engine", engine_label)
+
+            for engine_name, skip_reason in backtest_skip_reason_by_engine.items():
+                st.warning(f"{engine_name}: {skip_reason}")
+            for engine_name, missing_columns in backtest_missing_columns_by_engine.items():
+                if missing_columns:
                     st.warning(
-                        f"Only {int(backtest_results['total_signals'])} actionable signals were generated. "
-                        "This sample is small and should not be treated as statistically meaningful."
+                        f"{engine_name}: backtest results are missing required columns for the visualization layer: "
+                        + ", ".join(missing_columns)
                     )
 
-                st.markdown("#### Backtest Summary")
-                st.caption("These KPI cards summarize the existing signal-quality backtest. Interpretation labels are descriptive summaries, not investment advice.")
+            available_engines = [
+                engine_name
+                for engine_name in ["Main Signal Engine", "Will's Signal"]
+                if engine_name in backtest_results_by_engine and not backtest_missing_columns_by_engine.get(engine_name)
+            ]
+            if not available_engines:
+                st.info("No backtest engine produced usable results for the current settings.")
+            else:
+                if backtest_engine_mode == "Compare Both" and len(available_engines) < 2:
+                    st.warning("Comparison mode is active, but only one engine produced usable results with the current settings.")
 
-                backtest_cols = st.columns(5)
-                metric_with_help(
-                    backtest_cols[0],
-                    "Total Actionable Signals",
-                    int(backtest_results["total_signals"]),
-                    delta="Low confidence sample" if int(backtest_results["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS else None,
-                    delta_color="off",
-                    help_key="total_signals",
-                )
-                metric_with_help(backtest_cols[1], "BUY Signals", int(backtest_results["buy_signals"]), help_key="buy_signals")
-                metric_with_help(backtest_cols[2], "SELL Signals", int(backtest_results["sell_signals"]), help_key="sell_signals")
-                metric_with_help(backtest_cols[3], "BUY Win Rate", f"{backtest_results['buy_win_rate']:.1f}%", help_key="buy_win_rate")
-                metric_with_help(backtest_cols[4], "SELL Win Rate", f"{backtest_results['sell_win_rate']:.1f}%", help_key="sell_win_rate")
-
-                avg_cols = st.columns(3)
-                for index, horizon in enumerate((5, 10, 20)):
-                    average_value = float(backtest_results[f"average_forward_return_{horizon}"])
-                    median_value = float(backtest_results[f"median_forward_return_{horizon}"])
-                    avg_delta = "Weak / mixed" if average_value > 0 and median_value <= 0 else None
-                    metric_with_help(
-                        avg_cols[index],
-                        f"Avg Forward Return ({horizon})",
-                        f"{average_value:.2f}%",
-                        delta=avg_delta,
-                        delta_color="off",
-                        help_key="average_forward_return",
-                    )
-
-                median_cols = st.columns(3)
-                for index, horizon in enumerate((5, 10, 20)):
-                    median_value = float(backtest_results[f"median_forward_return_{horizon}"])
-                    median_delta = "Positive edge" if median_value > 0 else None
-                    metric_with_help(
-                        median_cols[index],
-                        f"Median Forward Return ({horizon})",
-                        f"{median_value:.2f}%",
-                        delta=median_delta,
-                        delta_color="off",
-                        help_key="median_forward_return",
-                    )
-
-                risk_cols = st.columns(3)
-                metric_with_help(
-                    risk_cols[0],
-                    "Signal Equity Max Drawdown",
-                    f"{backtest_results['max_drawdown']:.2f}%",
-                    delta="High drawdown" if drawdown_flag else None,
-                    delta_color="off",
-                    help_key="signal_equity_drawdown",
-                )
-                metric_with_help(risk_cols[1], "Buy-and-Hold Return", f"{backtest_results['buy_and_hold_return']:.2f}%", help_key="buy_and_hold_return")
-                metric_with_help(risk_cols[2], "Bars Used", str(int(backtest_results["bars_used"])), help_key="bars_used")
-
-                consistency_cols = st.columns(2)
-                metric_with_help(consistency_cols[0], "Backtest Start Price", format_money(backtest_results["start_price"]), help_key="start_price")
-                metric_with_help(consistency_cols[1], "Backtest End Price", format_money(backtest_results["end_price"]), help_key="end_price")
-
-                if actionable_signal_history.empty:
-                    st.info("No actionable BUY or SELL signals were available in the current backtest window, so the detailed analysis views are hidden.")
-                else:
-                    if not backtest_equity_frame.empty:
-                        st.markdown("#### Equity Curve")
-                        st.caption("Approximate rule-based strategy simulation using the existing backtest `position` series. This is not a brokerage-accurate trade simulator.")
-                        st.plotly_chart(create_backtest_equity_chart(backtest_equity_frame), use_container_width=True)
-
-                    detail_cols = st.columns(2)
-                    analysis_history = get_actionable_signal_history(backtest_signal_history, analysis_horizon)
-                    if analysis_history.empty:
-                        st.warning(
-                            f"No actionable signals had valid forward returns at the selected {analysis_horizon}-bar horizon."
+                if backtest_engine_mode == "Compare Both":
+                    comparison_rows = []
+                    for engine_name in available_engines:
+                        daily_history = actionable_signal_history_by_engine.get(engine_name, pd.DataFrame())
+                        cluster_history = cluster_signal_history_by_engine.get(engine_name, pd.DataFrame())
+                        selected_history = daily_history if signal_counting_mode == "Daily signals" else cluster_history
+                        summary_metrics = build_backtest_summary_metrics(
+                            backtest_results_by_engine[engine_name],
+                            selected_history,
+                            primary_horizon=5,
                         )
+                        overall_win_series = selected_history[get_forward_return_column(5)].dropna() if get_forward_return_column(5) in selected_history.columns else pd.Series(dtype=float)
+                        overall_win_rate = float((overall_win_series > 0).mean() * 100) if not overall_win_series.empty else 0.0
+                        comparison_rows.append(
+                            {
+                                "Engine": engine_name,
+                                "Total Daily Actionable Signals": int(len(daily_history)),
+                                "Independent Signal Clusters": int(len(cluster_history)),
+                                "Count Mode Used": signal_counting_mode,
+                                "BUY Signals": int(summary_metrics["buy_signals"]),
+                                "SELL Signals": int(summary_metrics["sell_signals"]),
+                                "Win Rate (5 Bars) %": round(overall_win_rate, 2),
+                                f"Average Forward Return ({analysis_horizon}) %": round(summary_metrics[f"average_forward_return_{analysis_horizon}"], 2),
+                                f"Median Forward Return ({analysis_horizon}) %": round(summary_metrics[f"median_forward_return_{analysis_horizon}"], 2),
+                                "Max Drawdown %": round(summary_metrics["max_drawdown"], 2),
+                                "Strategy Return %": round(summary_metrics["strategy_return"], 2),
+                                "Buy-and-Hold Return %": round(summary_metrics["buy_and_hold_return"], 2),
+                                "Bars Used": int(summary_metrics["bars_used"]),
+                            }
+                        )
+
+                    st.markdown("#### Engine Comparison")
+                    st.dataframe(pd.DataFrame(comparison_rows), hide_index=True, use_container_width=True)
+                    if backtest_equity_frames:
+                        st.markdown("#### Equity Curve Comparison")
+                        st.caption("Approximate rule-based strategy comparison using each engine's existing `position` logic. This is not a brokerage-accurate simulation.")
+                        st.plotly_chart(create_equity_comparison_chart(backtest_equity_frames), use_container_width=True)
+
+                    if len(available_engines) >= 2:
+                        latest_main_signal = backtest_signal_history_by_engine["Main Signal Engine"]["signal"].iloc[-1]
+                        latest_will_signal = backtest_signal_history_by_engine["Will's Signal"]["signal"].iloc[-1]
+                        if latest_main_signal != latest_will_signal:
+                            st.info(
+                                "Main Signal Engine and Will's Signal currently disagree. "
+                                "That is expected at times because they measure different things: the main engine is a broader explainable regime/structure model, "
+                                "while Will's Signal is a daily bullish continuation / exhaustion framework."
+                            )
+
+                    detail_engine_name = st.selectbox(
+                        "Detailed drill-down engine",
+                        options=available_engines,
+                        key="backtest_detail_engine",
+                        help="Choose which engine to use for the detailed distribution, regime, score-bucket, and best/worst signal analysis below.",
+                    )
+                else:
+                    detail_engine_name = backtest_engine_mode
+
+                if detail_engine_name not in backtest_results_by_engine:
+                    st.info(f"{detail_engine_name} did not produce usable backtest rows for the current settings.")
+                else:
+                    detail_backtest_results = backtest_results_by_engine[detail_engine_name]
+                    detail_signal_history = backtest_signal_history_by_engine.get(detail_engine_name, pd.DataFrame())
+                    detail_daily_history = actionable_signal_history_by_engine.get(detail_engine_name, pd.DataFrame())
+                    detail_cluster_history = cluster_signal_history_by_engine.get(detail_engine_name, pd.DataFrame())
+                    detail_selected_history = detail_daily_history if signal_counting_mode == "Daily signals" else detail_cluster_history
+                    detail_equity_frame = backtest_equity_frames.get(detail_engine_name, pd.DataFrame())
+                    detail_summary = build_backtest_summary_metrics(
+                        detail_backtest_results,
+                        detail_selected_history,
+                        primary_horizon=5,
+                    )
+                    detail_strategy_total_return = float(detail_backtest_results.get("strategy_return", 0.0))
+                    drawdown_flag = abs(float(detail_summary["max_drawdown"])) > max(10.0, abs(detail_strategy_total_return) * 0.75)
+
+                    if len(detail_daily_history) and len(detail_cluster_history) and len(detail_daily_history) >= max(2, len(detail_cluster_history) * 1.5):
+                        st.warning(
+                            f"{detail_engine_name} generated {len(detail_daily_history)} daily actionable signals but only {len(detail_cluster_history)} independent clusters. "
+                            "Repeated same-direction signals may inflate apparent performance."
+                        )
+
+                    concentration_warning = detect_top_signal_concentration_warning(detail_selected_history, analysis_horizon)
+                    if concentration_warning:
+                        st.warning(concentration_warning)
+
+                    interpretation_lines = build_backtest_interpretations(
+                        detail_summary,
+                        horizon=analysis_horizon,
+                        strategy_total_return=detail_strategy_total_return,
+                    )
+                    interpretation_message = "<ul style='margin:0;padding-left:1.1rem;'>" + "".join(
+                        f"<li>{escape(line)}</li>" for line in interpretation_lines
+                    ) + "</ul>"
+                    interpretation_accent = "#059669" if any(line.startswith("Positive edge") for line in interpretation_lines) else "#d97706"
+                    render_callout_box("Backtest Interpretation", interpretation_message, interpretation_accent)
+
+                    if int(detail_summary["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS:
+                        st.warning(
+                            f"Only {int(detail_summary['total_signals'])} actionable units were generated under the current counting mode. "
+                            "This sample is small and should not be treated as statistically meaningful."
+                        )
+
+                    st.markdown("#### Backtest Summary")
+                    st.caption("These KPI cards summarize the selected engine and counting mode. Interpretation labels are descriptive summaries, not investment advice.")
+
+                    count_cols = st.columns(2)
+                    metric_with_help(count_cols[0], "Total Daily Actionable Signals", int(len(detail_daily_history)), help_key="total_signals")
+                    metric_with_help(count_cols[1], "Independent Signal Clusters", int(len(detail_cluster_history)), help_key="total_signals")
+
+                    backtest_cols = st.columns(5)
+                    metric_with_help(
+                        backtest_cols[0],
+                        "Total Actionable Signals",
+                        int(detail_summary["total_signals"]),
+                        delta="Low confidence sample" if int(detail_summary["total_signals"]) < MIN_BACKTEST_CONFIDENCE_SIGNALS else None,
+                        delta_color="off",
+                        help_key="total_signals",
+                    )
+                    metric_with_help(backtest_cols[1], "BUY Signals", int(detail_summary["buy_signals"]), help_key="buy_signals")
+                    metric_with_help(backtest_cols[2], "SELL Signals", int(detail_summary["sell_signals"]), help_key="sell_signals")
+                    metric_with_help(backtest_cols[3], "BUY Win Rate", f"{detail_summary['buy_win_rate']:.1f}%", help_key="buy_win_rate")
+                    metric_with_help(backtest_cols[4], "SELL Win Rate", f"{detail_summary['sell_win_rate']:.1f}%", help_key="sell_win_rate")
+
+                    avg_cols = st.columns(3)
+                    for index, horizon in enumerate((5, 10, 20)):
+                        average_value = float(detail_summary[f"average_forward_return_{horizon}"])
+                        median_value = float(detail_summary[f"median_forward_return_{horizon}"])
+                        avg_delta = "Weak / mixed" if average_value > 0 and median_value <= 0 else None
+                        metric_with_help(
+                            avg_cols[index],
+                            f"Avg Forward Return ({horizon})",
+                            f"{average_value:.2f}%",
+                            delta=avg_delta,
+                            delta_color="off",
+                            help_key="average_forward_return",
+                        )
+
+                    median_cols = st.columns(3)
+                    for index, horizon in enumerate((5, 10, 20)):
+                        median_value = float(detail_summary[f"median_forward_return_{horizon}"])
+                        median_delta = "Positive edge" if median_value > 0 else None
+                        metric_with_help(
+                            median_cols[index],
+                            f"Median Forward Return ({horizon})",
+                            f"{median_value:.2f}%",
+                            delta=median_delta,
+                            delta_color="off",
+                            help_key="median_forward_return",
+                        )
+
+                    risk_cols = st.columns(3)
+                    metric_with_help(
+                        risk_cols[0],
+                        "Signal Equity Max Drawdown",
+                        f"{detail_summary['max_drawdown']:.2f}%",
+                        delta="High drawdown" if drawdown_flag else None,
+                        delta_color="off",
+                        help_key="signal_equity_drawdown",
+                    )
+                    metric_with_help(risk_cols[1], "Strategy Return", f"{detail_summary['strategy_return']:.2f}%", help_key="buy_and_hold_return")
+                    metric_with_help(risk_cols[2], "Buy-and-Hold Return", f"{detail_summary['buy_and_hold_return']:.2f}%", help_key="buy_and_hold_return")
+
+                    consistency_cols = st.columns(3)
+                    metric_with_help(consistency_cols[0], "Backtest Start Price", format_money(detail_summary["start_price"]), help_key="start_price")
+                    metric_with_help(consistency_cols[1], "Backtest End Price", format_money(detail_summary["end_price"]), help_key="end_price")
+                    metric_with_help(consistency_cols[2], "Bars Used", str(int(detail_summary["bars_used"])), help_key="bars_used")
+
+                    if detail_selected_history.empty:
+                        st.info("No actionable rows were available for the selected engine and counting mode, so the detailed analysis views are hidden.")
                     else:
-                        with detail_cols[0]:
-                            st.markdown("#### Forward Return Distribution")
-                            st.plotly_chart(
-                                create_forward_return_histogram(analysis_history, analysis_horizon),
-                                use_container_width=True,
-                            )
-                            st.caption("Returns to the right of 0% were favorable to the signal direction.")
+                        if not detail_equity_frame.empty:
+                            st.markdown("#### Equity Curve")
+                            st.caption("Approximate rule-based strategy simulation using the existing backtest `position` series. This is not a brokerage-accurate trade simulator.")
+                            st.plotly_chart(create_backtest_equity_chart(detail_equity_frame), use_container_width=True)
 
-                        with detail_cols[1]:
-                            st.markdown("#### Horizon Comparison")
-                            st.plotly_chart(
-                                create_horizon_comparison_chart(actionable_signal_history),
-                                use_container_width=True,
+                        detail_cols = st.columns(2)
+                        analysis_history = get_actionable_signal_history(detail_selected_history, analysis_horizon)
+                        if analysis_history.empty:
+                            st.warning(
+                                f"No actionable rows had valid forward returns at the selected {analysis_horizon}-bar horizon."
                             )
-                            horizon_table = build_horizon_comparison_table(actionable_signal_history).round(2)
-                            st.dataframe(horizon_table, hide_index=True, use_container_width=True)
-                            valid_horizon_table = horizon_table.dropna(subset=["Median Forward Return %"])
-                            if not valid_horizon_table.empty:
-                                best_horizon_row = valid_horizon_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
-                                st.caption(
-                                    f"On a median basis, the signals looked strongest over {best_horizon_row['Horizon']} "
-                                    f"with a median directional return of {best_horizon_row['Median Forward Return %']:.2f}%."
-                                )
-
-                        with st.expander("Performance by Regime", expanded=False):
-                            regime_table = build_regime_performance_table(analysis_history, analysis_horizon).round(2)
-                            if regime_table.empty:
-                                st.info("No regime-level performance rows were available for the selected horizon.")
-                            else:
-                                st.dataframe(regime_table, hide_index=True, use_container_width=True)
+                        else:
+                            with detail_cols[0]:
+                                st.markdown("#### Forward Return Distribution")
                                 st.plotly_chart(
-                                    create_regime_performance_chart(regime_table, analysis_horizon),
+                                    create_forward_return_histogram(analysis_history, analysis_horizon),
                                     use_container_width=True,
                                 )
-                                best_regime = regime_table.iloc[0]
-                                st.caption(
-                                    f"At the {analysis_horizon}-bar horizon, {best_regime['Regime']} produced the strongest median directional return "
-                                    f"({best_regime['Median Forward Return %']:.2f}%) in this sample."
-                                )
+                                st.caption("Returns to the right of 0% were favorable to the signal direction.")
 
-                        with st.expander("Performance by Score Bucket", expanded=False):
-                            score_bucket_table = build_score_bucket_table(analysis_history, analysis_horizon).round(2)
-                            if score_bucket_table.empty:
-                                st.info("No score-bucket rows were available for the selected horizon.")
-                            else:
-                                st.dataframe(score_bucket_table, hide_index=True, use_container_width=True)
+                            with detail_cols[1]:
+                                st.markdown("#### Horizon Comparison")
                                 st.plotly_chart(
-                                    create_score_bucket_chart(score_bucket_table, analysis_horizon),
+                                    create_horizon_comparison_chart(detail_selected_history),
                                     use_container_width=True,
                                 )
-                                strongest_bucket = score_bucket_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
-                                st.caption(
-                                    "A useful scoring model should usually show stronger directional outcomes in the more extreme score buckets than around neutral. "
-                                    f"In this sample, the best median outcome came from bucket {strongest_bucket['Score Bucket']} "
-                                    f"({strongest_bucket['Median Forward Return %']:.2f}%)."
-                                )
+                                horizon_table = build_horizon_comparison_table(detail_selected_history).round(2)
+                                st.dataframe(horizon_table, hide_index=True, use_container_width=True)
+                                valid_horizon_table = horizon_table.dropna(subset=["Median Forward Return %"])
+                                if not valid_horizon_table.empty:
+                                    best_horizon_row = valid_horizon_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
+                                    st.caption(
+                                        f"On a median basis, {detail_engine_name} looked strongest over {best_horizon_row['Horizon']} "
+                                        f"with a median directional return of {best_horizon_row['Median Forward Return %']:.2f}%."
+                                    )
 
-                        with st.expander("Best and Worst Signals", expanded=False):
-                            top_signals, worst_signals = build_best_worst_signal_tables(analysis_history, analysis_horizon)
-                            st.markdown(f"**Top 5 Signals ({analysis_horizon}-Bar Forward Return)**")
-                            st.dataframe(top_signals, hide_index=True, use_container_width=True)
-                            st.markdown(f"**Worst 5 Signals ({analysis_horizon}-Bar Forward Return)**")
-                            st.dataframe(worst_signals, hide_index=True, use_container_width=True)
+                            with st.expander("Performance by Regime", expanded=False):
+                                regime_table = build_regime_performance_table(analysis_history, analysis_horizon).round(2)
+                                if regime_table.empty:
+                                    st.info("No regime-level performance rows were available for the selected horizon.")
+                                else:
+                                    st.dataframe(regime_table, hide_index=True, use_container_width=True)
+                                    st.plotly_chart(
+                                        create_regime_performance_chart(regime_table, analysis_horizon),
+                                        use_container_width=True,
+                                    )
+                                    best_regime = regime_table.iloc[0]
+                                    st.caption(
+                                        f"At the {analysis_horizon}-bar horizon, {best_regime['Regime']} produced the strongest median directional return "
+                                        f"({best_regime['Median Forward Return %']:.2f}%) in this sample."
+                                    )
+
+                            with st.expander("Performance by Score Bucket", expanded=False):
+                                score_bucket_table = build_score_bucket_table(analysis_history, analysis_horizon).round(2)
+                                if score_bucket_table.empty:
+                                    st.info("No score-bucket rows were available for the selected horizon.")
+                                else:
+                                    st.dataframe(score_bucket_table, hide_index=True, use_container_width=True)
+                                    st.plotly_chart(
+                                        create_score_bucket_chart(score_bucket_table, analysis_horizon),
+                                        use_container_width=True,
+                                    )
+                                    strongest_bucket = score_bucket_table.sort_values("Median Forward Return %", ascending=False).iloc[0]
+                                    st.caption(
+                                        "A useful scoring model should usually show stronger directional outcomes in the more extreme score buckets than around neutral. "
+                                        f"In this sample, the best median outcome came from bucket {strongest_bucket['Score Bucket']} "
+                                        f"({strongest_bucket['Median Forward Return %']:.2f}%)."
+                                    )
+
+                            with st.expander("Best and Worst Signals", expanded=False):
+                                top_signals, worst_signals = build_best_worst_signal_tables(analysis_history, analysis_horizon)
+                                st.markdown(f"**Top 5 Signals ({analysis_horizon}-Bar Forward Return)**")
+                                st.dataframe(top_signals, hide_index=True, use_container_width=True)
+                                st.markdown(f"**Worst 5 Signals ({analysis_horizon}-Bar Forward Return)**")
+                                st.dataframe(worst_signals, hide_index=True, use_container_width=True)
 
                 with st.expander("Backtest Limitations", expanded=False):
-                    st.write("- This is a signal-quality backtest, not a full brokerage-accurate simulation.")
+                    st.write("- This remains a signal-quality backtest unless you switch the interpretation to cluster/trade counting mode.")
+                    st.write("- It is not a full brokerage-accurate simulation.")
                     st.write("- It does not fully model commissions, slippage, bid/ask spread, taxes, liquidity, order execution, or real position sizing.")
-                    st.write("- BUY and SELL win rates are based on the first forward-return horizon unless a different horizon is shown in the detailed analysis views.")
-                    st.write("- A small number of signals is not statistically meaningful.")
-                    st.write("- Good historical results do not guarantee future performance.")
+                    st.write("- Good historical performance does not guarantee future results.")
 
         st.divider()
         st.subheader("Actionable Support/Resistance Levels")

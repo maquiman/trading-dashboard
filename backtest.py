@@ -7,14 +7,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from signals import build_feature_frame, evaluate_signal_row
+from signals import build_feature_frame, detect_regime, evaluate_signal_row
 from levels import build_level_snapshot
 from vcp import apply_vcp_to_signal, detect_vcp
+from wills_signal import (
+    DEFAULT_WILLS_SIGNAL_CONFIG,
+    WillsSignalConfig,
+    calculate_wills_exhaustion_signal,
+    calculate_wills_signal,
+)
 
 
-def _empty_backtest_result() -> dict:
+def _empty_backtest_result(engine_name: str = "Main Signal Engine") -> dict:
     """Return a consistent empty backtest payload."""
     return {
+        "engine_name": engine_name,
         "total_signals": 0,
         "buy_signals": 0,
         "sell_signals": 0,
@@ -27,11 +34,131 @@ def _empty_backtest_result() -> dict:
         "median_forward_return_10": 0.0,
         "median_forward_return_20": 0.0,
         "max_drawdown": 0.0,
+        "strategy_return": 0.0,
         "buy_and_hold_return": 0.0,
         "start_price": 0.0,
         "end_price": 0.0,
         "bars_used": 0,
         "signal_history": pd.DataFrame(),
+    }
+
+
+def _summarize_signal_history(
+    signal_history: pd.DataFrame,
+    close: pd.Series,
+    lookback_periods: tuple[int, ...],
+    engine_name: str,
+) -> dict:
+    """Build a consistent summary payload from a backtest signal history."""
+    if signal_history.empty:
+        return _empty_backtest_result(engine_name=engine_name)
+
+    actionable_history = signal_history[signal_history["signal"].isin(["BUY", "SELL"])].copy()
+    buy_signal_count = int((actionable_history["signal"] == "BUY").sum())
+    sell_signal_count = int((actionable_history["signal"] == "SELL").sum())
+    total_signal_count = buy_signal_count + sell_signal_count
+
+    directional_returns = {
+        period: actionable_history.get(f"forward_return_{period}", pd.Series(dtype=float)).dropna().tolist()
+        for period in lookback_periods
+    }
+    buy_returns = {
+        period: actionable_history.loc[actionable_history["signal"] == "BUY", f"forward_return_{period}"].dropna().tolist()
+        for period in lookback_periods
+    }
+    sell_returns = {
+        period: actionable_history.loc[actionable_history["signal"] == "SELL", f"forward_return_{period}"].dropna().tolist()
+        for period in lookback_periods
+    }
+
+    buy_win_rate = 0.0
+    if buy_returns[lookback_periods[0]]:
+        buy_win_rate = 100 * sum(value > 0 for value in buy_returns[lookback_periods[0]]) / len(buy_returns[lookback_periods[0]])
+
+    sell_win_rate = 0.0
+    if sell_returns[lookback_periods[0]]:
+        sell_win_rate = 100 * sum(value > 0 for value in sell_returns[lookback_periods[0]]) / len(sell_returns[lookback_periods[0]])
+
+    close_returns = close.pct_change().fillna(0.0)
+    aligned_positions = signal_history["position"].reindex(close.index).ffill().fillna(0.0)
+    strategy_returns = aligned_positions.shift(1).fillna(0.0) * close_returns
+    strategy_equity = (1 + strategy_returns).cumprod()
+    strategy_drawdown = strategy_equity / strategy_equity.cummax() - 1
+    max_drawdown = float(strategy_drawdown.min() * 100) if not strategy_drawdown.empty else 0.0
+    strategy_return = float((strategy_equity.iloc[-1] - 1) * 100) if not strategy_equity.empty else 0.0
+
+    start_close = float(close.iloc[0])
+    end_close = float(close.iloc[-1])
+    buy_and_hold_return = 0.0
+    if start_close != 0:
+        buy_and_hold_return = float((end_close / start_close - 1) * 100)
+
+    return {
+        "engine_name": engine_name,
+        "total_signals": total_signal_count,
+        "buy_signals": buy_signal_count,
+        "sell_signals": sell_signal_count,
+        "buy_win_rate": float(buy_win_rate),
+        "sell_win_rate": float(sell_win_rate),
+        "average_forward_return_5": float(np.mean(directional_returns[5])) if directional_returns[5] else 0.0,
+        "average_forward_return_10": float(np.mean(directional_returns[10])) if directional_returns[10] else 0.0,
+        "average_forward_return_20": float(np.mean(directional_returns[20])) if directional_returns[20] else 0.0,
+        "median_forward_return_5": float(np.median(directional_returns[5])) if directional_returns[5] else 0.0,
+        "median_forward_return_10": float(np.median(directional_returns[10])) if directional_returns[10] else 0.0,
+        "median_forward_return_20": float(np.median(directional_returns[20])) if directional_returns[20] else 0.0,
+        "max_drawdown": max_drawdown,
+        "strategy_return": strategy_return,
+        "buy_and_hold_return": buy_and_hold_return,
+        "start_price": start_close,
+        "end_price": end_close,
+        "bars_used": int(len(close)),
+        "signal_history": signal_history,
+    }
+
+
+def classify_wills_backtest_signal(
+    wills_signal_result: dict,
+    wills_exhaustion_result: dict,
+    buy_threshold: int = 7,
+    sell_threshold: int = 3,
+    exhaustion_sell_threshold: int = 6,
+) -> dict:
+    """Convert Will's bullish and exhaustion scores into a simple backtest action."""
+    will_score = int(wills_signal_result.get("score", 0))
+    exhaustion_score = int(wills_exhaustion_result.get("score", 0))
+    bullish_label = wills_signal_result.get("interpretation", {}).get("label", "Will's Signal")
+    exhaustion_label = wills_exhaustion_result.get("interpretation", {}).get("label", "Will's Exhaustion Signal")
+
+    if exhaustion_score >= exhaustion_sell_threshold:
+        return {
+            "trade_signal": "SELL",
+            "bias": f"Exit warning: {exhaustion_label}",
+            "signal_style": "Will's Exhaustion / Exit",
+            "score": will_score,
+            "exhaustion_score": exhaustion_score,
+        }
+    if will_score <= sell_threshold:
+        return {
+            "trade_signal": "SELL",
+            "bias": "Weak bullish setup / exit",
+            "signal_style": "Will's Weak Setup",
+            "score": will_score,
+            "exhaustion_score": exhaustion_score,
+        }
+    if will_score >= buy_threshold:
+        return {
+            "trade_signal": "BUY",
+            "bias": bullish_label,
+            "signal_style": "Will's Bullish Continuation",
+            "score": will_score,
+            "exhaustion_score": exhaustion_score,
+        }
+    return {
+        "trade_signal": "HOLD",
+        "bias": bullish_label,
+        "signal_style": "Will's Neutral / Watch",
+        "score": will_score,
+        "exhaustion_score": exhaustion_score,
     }
 
 
@@ -52,14 +179,10 @@ def backtest_signals_no_lookahead(
     """
     required_history = max(55, max(lookback_periods) + 1)
     if len(df) < required_history:
-        return _empty_backtest_result()
+        return _empty_backtest_result(engine_name="Main Signal Engine")
 
     feature_frame = build_feature_frame(df, ticker)
     close = df["Close"]
-
-    directional_returns = {period: [] for period in lookback_periods}
-    buy_returns = {period: [] for period in lookback_periods}
-    sell_returns = {period: [] for period in lookback_periods}
 
     history_rows = []
     active_position = 0.0
@@ -100,6 +223,7 @@ def backtest_signals_no_lookahead(
 
         history_row = {
             "date": df.index[idx],
+            "engine": "Main Signal Engine",
             "close": float(close.iloc[idx]),
             "signal": signal,
             "bias": signal_result["current_bias"],
@@ -115,59 +239,105 @@ def backtest_signals_no_lookahead(
                 raw_forward_return = close.iloc[idx + period] / close.iloc[idx] - 1
                 if signal == "BUY":
                     forward_value = raw_forward_return * 100
-                    directional_returns[period].append(forward_value)
-                    buy_returns[period].append(forward_value)
                 elif signal == "SELL":
                     forward_value = -raw_forward_return * 100
-                    directional_returns[period].append(forward_value)
-                    sell_returns[period].append(forward_value)
             history_row[f"forward_return_{period}"] = forward_value
 
         history_rows.append(history_row)
 
     signal_history = pd.DataFrame(history_rows).set_index("date")
+    return _summarize_signal_history(
+        signal_history=signal_history,
+        close=close,
+        lookback_periods=lookback_periods,
+        engine_name="Main Signal Engine",
+    )
 
-    buy_signal_count = int((signal_history["signal"] == "BUY").sum())
-    sell_signal_count = int((signal_history["signal"] == "SELL").sum())
-    total_signal_count = buy_signal_count + sell_signal_count
 
-    buy_win_rate = 0.0
-    if buy_returns[lookback_periods[0]]:
-        buy_win_rate = 100 * sum(value > 0 for value in buy_returns[lookback_periods[0]]) / len(buy_returns[lookback_periods[0]])
+def backtest_wills_signal_no_lookahead(
+    df: pd.DataFrame,
+    ticker: str,
+    lookback_periods: tuple[int, ...] = (5, 10, 20),
+    buy_threshold: int = 7,
+    sell_threshold: int = 3,
+    exhaustion_sell_threshold: int = 6,
+    config: WillsSignalConfig = DEFAULT_WILLS_SIGNAL_CONFIG,
+) -> dict:
+    """Backtest Will's Signal using daily-only history available up to each date."""
+    required_history = max(
+        config.min_daily_bars,
+        max(lookback_periods) + 1,
+        config.adx_period * 2,
+        config.macd_slow + config.macd_signal,
+        config.rsi_divergence_lookback,
+        config.ema_period + 1,
+    )
+    if len(df) < required_history:
+        return _empty_backtest_result(engine_name="Will's Signal")
 
-    sell_win_rate = 0.0
-    if sell_returns[lookback_periods[0]]:
-        sell_win_rate = 100 * sum(value > 0 for value in sell_returns[lookback_periods[0]]) / len(sell_returns[lookback_periods[0]])
+    feature_frame = build_feature_frame(df, ticker)
+    close = df["Close"]
+    history_rows = []
+    active_position = 0.0
 
-    close_returns = close.pct_change().fillna(0.0)
-    aligned_positions = signal_history["position"].reindex(df.index).ffill().fillna(0.0)
-    strategy_returns = aligned_positions.shift(1).fillna(0.0) * close_returns
-    strategy_equity = (1 + strategy_returns).cumprod()
-    strategy_drawdown = strategy_equity / strategy_equity.cummax() - 1
-    max_drawdown = float(strategy_drawdown.min() * 100) if not strategy_drawdown.empty else 0.0
+    for idx in range(required_history - 1, len(df)):
+        hist_df = df.iloc[: idx + 1]
+        will_result = calculate_wills_signal(
+            hist_df,
+            ticker=ticker,
+            config=config,
+            include_earnings_warning=False,
+        )
+        exhaustion_result = calculate_wills_exhaustion_signal(
+            hist_df,
+            ticker=ticker,
+            config=config,
+        )
+        classification = classify_wills_backtest_signal(
+            will_result,
+            exhaustion_result,
+            buy_threshold=buy_threshold,
+            sell_threshold=sell_threshold,
+            exhaustion_sell_threshold=exhaustion_sell_threshold,
+        )
+        regime_info = detect_regime(feature_frame.iloc[idx])
+        signal = classification["trade_signal"]
 
-    start_close = float(close.iloc[0])
-    end_close = float(close.iloc[-1])
-    buy_and_hold_return = 0.0
-    if start_close != 0:
-        buy_and_hold_return = float((end_close / start_close - 1) * 100)
+        if signal == "BUY":
+            active_position = 1.0
+        elif signal == "SELL":
+            active_position = 0.0
 
-    return {
-        "total_signals": total_signal_count,
-        "buy_signals": buy_signal_count,
-        "sell_signals": sell_signal_count,
-        "buy_win_rate": float(buy_win_rate),
-        "sell_win_rate": float(sell_win_rate),
-        "average_forward_return_5": float(np.mean(directional_returns[5])) if directional_returns[5] else 0.0,
-        "average_forward_return_10": float(np.mean(directional_returns[10])) if directional_returns[10] else 0.0,
-        "average_forward_return_20": float(np.mean(directional_returns[20])) if directional_returns[20] else 0.0,
-        "median_forward_return_5": float(np.median(directional_returns[5])) if directional_returns[5] else 0.0,
-        "median_forward_return_10": float(np.median(directional_returns[10])) if directional_returns[10] else 0.0,
-        "median_forward_return_20": float(np.median(directional_returns[20])) if directional_returns[20] else 0.0,
-        "max_drawdown": max_drawdown,
-        "buy_and_hold_return": buy_and_hold_return,
-        "start_price": start_close,
-        "end_price": end_close,
-        "bars_used": int(len(close)),
-        "signal_history": signal_history,
-    }
+        history_row = {
+            "date": df.index[idx],
+            "engine": "Will's Signal",
+            "close": float(close.iloc[idx]),
+            "signal": signal,
+            "bias": classification["bias"],
+            "score": float(classification["score"]),
+            "wills_score": float(classification["score"]),
+            "wills_exhaustion_score": float(classification["exhaustion_score"]),
+            "regime": regime_info["label"],
+            "signal_style": classification["signal_style"],
+            "position": active_position,
+        }
+
+        for period in lookback_periods:
+            forward_value = np.nan
+            if idx + period < len(df):
+                raw_forward_return = close.iloc[idx + period] / close.iloc[idx] - 1
+                if signal == "BUY":
+                    forward_value = raw_forward_return * 100
+                elif signal == "SELL":
+                    forward_value = -raw_forward_return * 100
+            history_row[f"forward_return_{period}"] = forward_value
+
+        history_rows.append(history_row)
+
+    signal_history = pd.DataFrame(history_rows).set_index("date")
+    return _summarize_signal_history(
+        signal_history=signal_history,
+        close=close,
+        lookback_periods=lookback_periods,
+        engine_name="Will's Signal",
+    )
